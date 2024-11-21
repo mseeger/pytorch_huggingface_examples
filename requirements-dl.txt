@@ -1,0 +1,9 @@
+# PyTorch
+torch
+torchvision
+# Hugging Face
+datasets
+evaluate
+tokenizers
+accelerate>=0.26.0
+transformers

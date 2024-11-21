@@ -1,0 +1,4 @@
+boto3
+PyYaml
+ujson
+s3fs
