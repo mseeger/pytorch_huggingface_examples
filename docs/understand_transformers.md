@@ -28,12 +28,11 @@ File: `litgpt/config.py`.
 General size parameters:
 - `block_size`: Context width. Maximum (and default) value for `max_seq_length`.
 - `vocab_size`, `padded_vocab_size`: Number of different tokens in vocabulary.
-  Latter padded to nearest multiple of `padding_multiple`, so that embedding
-  parameters are power of 2.
+  Latter padded to nearest multiple of `padding_multiple`.
 - `n_layer`: Number of layers (or transformer blocks)
 - `n_embd`: Embedding dimension. Each token is associated with vector of this size.
 
-Transformer block (normalizations):
+Transformer block (structure, normalizations):
 - `norm_class`, `norm_class_name`, `norm_eps`: Type of normalization used at different
   places in transformer block (choices "LayerNorm", "RMSNorm")
 - `shared_attention_norm`, `parallel_residual`: See [GPT(nn.Module)](#gptnnmodule).
@@ -46,9 +45,11 @@ Transformer block (self-attention):
 - `n_query_groups`: Defaults to `n_head` for MHA. If smaller, must have
   `n_head % n_query_groups == 0`. In MHA, we use `n_head` Q, K, V vectors of
   size `head_size` each. If `n_query_groups < n_head`, some K, V vectors are shared.
-  Namely, there are `n_query_groups` K, V vectors, and `n_head` Q vectors. This
-  leads to smaller KV-caches. MQA (multi-query attention) has `n_query_groups = 1`.
-- `attn_bias`: Whether linear block mapping to Q, K, V vectors has biases.
+  Namely, there are `n_query_groups` K, V vectors, and `n_head` Q vectors. Put
+  differently, there are `n_query_groups` query groups, each consisting of one K,
+  one V and `n_head / n_query_groups` Q vectors. This leads to smaller KV-caches.
+  MQA (multi-query attention) has `n_query_groups = 1`.
+- `attn_bias`: Whether linear blocks mapping to Q, K, V vectors have biases.
   What is used is `bias or attn_bias`.
 - `sliding_window_size`, `sliding_window_layer_placing`: See
   [CausalSelfAttention(nn.Module)](#causalselfattentionnnmodule).
@@ -57,16 +58,21 @@ Transformer block (self-attention):
   `d = head_size`.
 - `attention_logit_softcapping`: Inner product scores going into softmax are
   softly capped to `[-attention_logit_softcapping, attention_logit_softcapping]`.
-  Note: If this is used, cannot use
+  **Note**: If this is used, cannot use
   `torch.nn.functional.scaled_dot_product_attention`, so no Flash attention,
-  see [CausalSelfAttention(nn.Module)](#causalselfattentionnnmodule).
+  see [CausalSelfAttention(nn.Module)](#causalselfattentionnnmodule). This can
+  be a lot slower and require more memory. Only used in Gemma-2 models.
 
 Transformer block (MLP):
-- `mlp_class`, `mlp_class_name`: Type of MLP being used
-- `intermediate_size`: Size of hidden layer in MLP
-- `gelu_approximate`: Parameter for `torch.nn.functional.gelu`
-- `bias`: Whether linear blocks in MLP have biases. Also affects
-  projection block in self-attention.
+- `mlp_class`, `mlp_class_name`: Type of MLP being used, choices are
+  "GptNeoxMLP", "LLaMAMLP", "GemmaMLP", "LLaMAMoE", defaults to
+  "GptNeoxMLP"
+- `intermediate_size`: Size of hidden layer in MLP. Typically a small multiple
+  of `n_embd`
+- `gelu_approximate`: Parameter for `torch.nn.functional.gelu` (for those MLPs
+  using GELU)
+- `bias`: Whether linear blocks in MLP have biases. Also affects linear blocks
+  in self-attention.
 - `n_expert`, `n_expert_per_token`: Parameters of `LLaMAMoE` (special MoE model).
 
 GPT before/after blocks:
@@ -80,7 +86,7 @@ for parameter semantics:
 - `rope_base`: Defaults to 10000 (from paper).
 - `rotary_percentage`: Defaults to 0.25.
 - `rope_condense_ratio`: Defaults to 1.
-- `rope_adjustments`: Dictionary with further parameters.
+- `rope_adjustments`: Dictionary with further parameters (optional).
 
 
 ## Model (GPT)
@@ -92,7 +98,8 @@ File: `litgpt/model.py`.
 - Input embeddings `transformer.wte`, blocks `transformer.h` (`config.n_layer`
   `Block` objects), final function `transformer.ln_f` (norm of
   `config.norm_class`)
-- Linear head `lm_head`, final dimension from `config.n_embd` to `config.padded_vocab_size`
+- Linear head `lm_head`, final dimension from `config.n_embd` to
+  `config.padded_vocab_size`. Maps to final logits over padded vocabulary
 - Maintains `cos`, `sin` (RoPE cache)
 - `max_seq_length`: Must be `<= config.block_size` (the initial value), can be
   changed to save time and memory.
@@ -103,8 +110,11 @@ File: `litgpt/model.py`.
 - Optional (`config.scale_embeddings`): Scaling input embeddings
 - Optional (`config.final_logit_softcapping`): Soft capping of final outputs
 
-TODO:
-- `rope_cache` (RoPE), `set_kv_cache` (KV cache)
+Soft capping works as follows:
+```python
+def do_softcapping(x: torch.Tensor, thresh: float) -> torch.Tensor:
+    return torch.tanh(x / thresh) * thresh
+```
 
 ### Block(nn.Module)
 
@@ -139,7 +149,7 @@ def forward(
   `config.norm_class`
 - Default is non-parallel residuals
 - Parallel residuals: `attn`, `mlp` in parallel and added. Optionally, the "before"
-  norms can be shared. Note that none of the models in `config.py` are using
+  normalizations can be shared. Note that none of the models in `config.py` are using
   parallel residuals. Is this a good idea?
 
 
@@ -169,15 +179,17 @@ Let `hs = head_size`, `nqg = n_query_groups`:
 
 - Apply `attn`: `(B, T, total_qkv * nqg * hs)`
 - Reshape and permute: `(B, nqg, total_qkv, T, hs)`
-- Split into `q` `(B, nqg, q_per_kv, T, hs)`, `k`, `v` `(B, nqg, 1, T, hs)`
+- Split into `q` of shape `(B, nqg, q_per_kv, T, hs)`, `k`, `v` of shape
+  `(B, nqg, 1, T, hs)`
 - If not MHA and (not generative inference or not MQA): Expand `k`, `v` to
   same shape `(B, nqg, q_per_kv, T, hs)` as `q`. This means the
   singleton dimension is expanded by repeating (broadcasting), just using a
   stride of 0 (read-only!).
-- Reshape all three to `(B, -1, T, hs)`
-- RoPE: Apply `cos`, `sin` to `q`, `k` (TODO)
-- If generative inference: Have `T == 1`, this is correct for `q`, but not
-  for `k`, `v`. Get them from `kv_cache` (TODO)
+- Reshape all three to `(B, n_head, T, hs)`
+- RoPE: Apply `cos`, `sin` to `q`, `k`
+- If generative inference: This is correct for `q`, but not for `k`, `v`.
+  Get them from `kv_cache`. Then, `k`, `v` have shape `(B, n_head, T2, hs)`
+  with `T2 >= T`.
 - If `apply_sliding_window_attention`: Add something to `mask` (TODO)
 - `y = self.scaled_dot_product_attention(q, k, v, mask)`, result has shape
   `(B, T, n_head, hs)`.
@@ -192,19 +204,21 @@ def scaled_dot_product_attention(
     mask: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
 ```
-`q`, `k`, `v` have shape `(B, n_head, T, hs)`. If `mask` is given, it has shape
-`(T, T)`. Note that the default is `mask = None`, which means causal self-attention.
+`q` has shape `(B, n_head, T1, hs)`, `k`, `v` have shape `(B, n_head, T2, hs)`, 
+where `T2 >= T1`. If `mask` is given, it has shape `(T1, T2)`. Note that the
+default is `mask = None`, which means causal self-attention, where also
+`T1 == T2`.
 
-- The output is a tensor of shape `(B, T, n_head, hs)`. The computations
-  deliver `(B, n_head, T, hs)`, then a final `transpose(1, 2)`.
+- The output is a tensor of shape `(B, T1, n_head, hs)`. The computations
+  deliver `(B, n_head, T1, hs)`, then a final `transpose(1, 2)`.
 - If `config.attention_logit_softcapping` is not given, this simply calls
   `torch.nn.functional.scaled_dot_product_attention`, which is highly
   optimized (Flash attention). We pass `attn_mask=mask`, `is_causal=mask is None`,
-  and no dropout. The default is causal with `mask == None`, a mask is used
+  and no dropout. The default is causal with `mask=None`, a mask is used
   only for generative inference.
 - If `config.attention_logit_softcapping`, the Q-K inner product score values
   are soft-capped before going into the softmax. This can be a lot slower and
-  materializes a `(B, n_head, T, T)` matrix.
+  materializes a `(B, n_head, T1, T2)` tensor.
 
 
 ### GptNeoxMLP, LLaMAMLP, GemmaMLP
@@ -273,11 +287,56 @@ This means that row `i` of `cos` is given by the concatenation of two copies
 of `[cos(i * theta[0]), cos(i * theta[1]), ..., cos(i * theta[-1])]`.
 
 If `rope_adjustments` is given, the `theta` values are adjusted in a certain
-way, this is not part of the original RoPE paper.
+way, this is not part of the original RoPE paper. It is used in Llama-3.1,
+Llama-3.2, Llama-3.3 models.
 
 RoPE is then applied to the first `rope_n_elem` entries of K and Q vectors. This
-is done like in the RoPE paper, except there they group `(0, 1), (2, 3), ...`,
-whereas here they group `(0, ne2), (1, ne2 + 1), ...`, where `ne2 = rope_n_elem / 2`.
+is done like in the RoPE paper, except there they group scalars `(0, 1), (2, 3), ...`
+for rotation, whereas here they group `(0, ne2), (1, ne2 + 1), ...`, where
+`ne2 = rope_n_elem / 2`. This difference could be a problem. If a model was
+pretrained with the RoPE paper convention, then fine-tuning with the different
+convention here would be suboptimal.
+
+#### What is Hugging Face doing?
+
+`src/transformers/modeling_rope_utils.py`:
+- `_compute_default_rope_parameters`, `ROPE_INIT_FUNCTIONS["default"]`: Compute
+  `theta` parameters by default.
+- `_compute_llama3_parameters`, `ROPE_INIT_FUNCTIONS["llama3"]`: Additional
+  adjustments given by `rope_adjustments` above.
+- They seem to only register the `theta` vector, as "inv_freq"
+
+The rest is done specific for every model. For example:
+`src/transformers/models/gpt_neox/modeling_gpt_neox.py`:
+- `GPTNeoXRotaryEmbedding`: Registers `theta` as "inv_freq". `forward` computes
+  `sin`, `cos` of shape `(B, T, hs)`, where `B` is batch size. The input is
+  `position_ids` of shape `(B, T)`, which can have different positions for each
+  case in the batch. If `B = 1` and `position_ids = arange(0, T)`, this is the
+  same as in LitGPT.
+- `apply_rotary_pos_emb`, `rotate_half`: They do the same as in LitGPT.
+
+Hugging Face does the same as LitGPT, which deviates from the RoPE paper.
+
+**But**: The Llama reference implementation groups scalars as `(0, 1), (2, 3), ...`.
+Namely, in https://github.com/meta-llama/llama/blob/main/llama/model.py#L132:
+
+```python
+xq_ = torch.view_as_complex(xq.float().reshape(*xq.shape[:-1], -1, 2))
+xk_ = torch.view_as_complex(xk.float().reshape(*xk.shape[:-1], -1, 2))
+freqs_cis = reshape_for_broadcast(freqs_cis, xq_)
+xq_out = torch.view_as_real(xq_ * freqs_cis).flatten(3)
+xk_out = torch.view_as_real(xk_ * freqs_cis).flatten(3)
+```
+
+Here, the reshaping of `xq`, `xk` means that the final dimension `(hs,)` is
+reshaped to `(hs/2, 2)`, inducing a grouping `(0, 1), (2, 3), ...`.
+This reference implementation is also used in TorchTune, see
+https://pytorch.org/torchtune/0.3/generated/torchtune.modules.RotaryPositionalEmbeddings.html.
+
+This has been noted: https://github.com/huggingface/transformers/issues/25199.
+Hugging Face corrects for this by permuting the K and V weight linear transform
+weights accordingly when loading Llama checkpoints. It is not very clear why
+there is this difference.
 
 
 ### Ignored For Now
@@ -292,7 +351,40 @@ whereas here they group `(0, ne2), (1, ne2 + 1), ...`, where `ne2 = rope_n_elem 
 
 ## Generative Inference, KV Cache
 
-HIER!
+If `input_pos` is given in `GPT.forward`, it contains the token positions
+corresponding to the token indices in `idx`, where `idx.shape == (B, idx_size)`.
+Either `input_pos.shape == (idx_size,)` or `input_pos.shape == (B, idx_size)`
+(batched index). If `input_pos is None`, this corresponds to the default case
+`input_pos == arange(idx_size)`, when all inputs up to `idx_size` are given.
+
+The case `input_pos is not None` is needed for generative inference. Typically,
+tokens are sampled one by one, after the prompt has been processed. Then,
+`idx_size == 1`. Also, a very large prompt can be processed in batches of size
+`idx_size > 1`, updating the KV cache in between.
+
+In the generative inference case, `q`, `k`, `v` in
+`CausalSelfAttention.forward` are computed for positions in `input_pos`. This
+is correct for `q`, but not for `k`, `v`, where we need vectors for earlier
+positions as well. This is why we have there:
+
+```python
+if input_pos is not None:
+    if not isinstance(self.kv_cache, KVCache):
+        raise TypeError("You need to call `gpt.set_kv_cache()`")
+    k, v = self.kv_cache(input_pos, k, v)
+```
+
+The resulting `k`, `v` are extended by the K and V vectors from the cache, so
+that causal self-attention is correct in this case. At the same time, the KV
+cache is updated by the new `k`, `v` vectors passed as input.
+
+HIER: How does the implemented KV cache work? Are there other implementations?
+- `GPT`: `set_kv_cache`, `clear_kv_cache`
+- `CausalSelfAttention`: `build_kv_cache`, `kv_cache` member
+- `KVCache` class. Don't see other implementations
+
+Idea for project: A performant KV cache implementing eviction strategies like
+heavy hitter oracle.
 
 
 ## Fine-tuning with LoRA and Adapters 
