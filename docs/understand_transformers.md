@@ -351,6 +351,46 @@ there is this difference.
 
 ## Generative Inference, KV Cache
 
+Here, we figure out how generative inference works, and how this is supported
+by the KV cache. Generative inference proceeds in two stages:
+- Prefilling of prompt: Just like processing for training (unless the prompt is
+  too large for the KV cache space)
+- Generating the output token by token. This requires a single-token forward
+  pass for each token, which generates Q, K, V vectors for this token. The KV
+  cache is then used to retrieve K, V vectors from the past (possibly sparse).
+
+### Generative Inference, given Model
+
+First, to generate a single sequence (batch size 1):
+- `generate.base.generate`. Calls:
+- `generate.base.generate_fn`. Calls `token = next_token(model, input_pos, token.view(1, -1))`
+  in a loop. The first call processes the whole prompt, with
+  `token = prompt`, `input_pos = arange(prompt_size)`. This is called prefill.
+  We do not use `input_pos=None`, because the KV cache should be populated.
+  Subsequent calls use `input_ind = [p]`, `p = prompt_size, prompt_size + 1, ...`.
+- `generate.base.next_token`: Very simple:
+  ```python
+  def next_token(model, input_pos, x, **kwargs):
+      logits = model(x, input_pos)
+      _next = sample(logits, **kwargs).to(dtype=torch.int64)
+      return _next
+  ```
+
+The prefill call could also be done with `input_pos=None`, in which case the
+`mask` variable does not have to be used. But then, we'd still have to populate
+the KV caches. Doing it the way it is done here, seems simpler.
+
+Next, how to generate a batch of sequences? This is not yet supported through
+`generate`, but there is already some code in `generate/base.py`:
+`batched_generate_fn`, `batched_next_token`, `batched_sample`. However, this
+code assumes that all prompts have the same length, which is not so useful.
+Maybe this can be done better? See [Small Extensions](#small-extensions).
+
+Other modules and scripts in `generate` are about generation with adapters, or
+where layers are partitioned across devices.
+
+### Support by the Model
+
 If `input_pos` is given in `GPT.forward`, it contains the token positions
 corresponding to the token indices in `idx`, where `idx.shape == (B, idx_size)`.
 Either `input_pos.shape == (idx_size,)` or `input_pos.shape == (B, idx_size)`
@@ -374,19 +414,103 @@ if input_pos is not None:
     k, v = self.kv_cache(input_pos, k, v)
 ```
 
-The resulting `k`, `v` are extended by the K and V vectors from the cache, so
-that causal self-attention is correct in this case. At the same time, the KV
-cache is updated by the new `k`, `v` vectors passed as input.
+The resulting `k`, `v` are extended by the K and V vectors from the cache (in
+fact to full length `max_seq_length`, see below), so that causal self-attention 
+is correct in this case. At the same time, the KV cache is updated by the new
+`k`, `v` vectors passed as input.
 
-HIER: How does the implemented KV cache work? Are there other implementations?
-- `GPT`: `set_kv_cache`, `clear_kv_cache`
-- `CausalSelfAttention`: `build_kv_cache`, `kv_cache` member
-- `KVCache` class. Don't see other implementations
+The `GPT` class also has a `mask_cache` member, which is set in `set_kv_cache`.
+It is a boolean tensor of shape `(1, 1, max_seq_length, max_seq_length)`, which
+is lower triangular. If `input_pos` is given, `mask` is created as
+`mask = batched_index_select(self.mask_cache, 2, input_pos)`. This has
+shape `(1, 1, T, max_seq_length)`. It is used as mask on the Q-K scores. This
+makes sense, because the `q` vectors have length `T`, the `k` vectors have full
+length `max_seq_length` (which is wasteful).
 
-Idea for project: A performant KV cache implementing eviction strategies like
-heavy hitter oracle.
+### KVCache Implementation
+
+The `CausalSelfAttention` object of each block has a `KVCache` object, which
+is created when `GPT.set_kv_cache` is called.
+
+`KVCache` is a very simple implementation. It allocates two tensors `self.k`,
+`self.v` of shape `(batch_size, heads, max_seq_length, head_size)`, where
+`heads = 1` if `n_query_groups == 1` (MQA), and `heads = n_head` otherwise.
+One would expect `heads == n_query_groups` here also if
+`1 < n_query_groups < n_head`, but this is not the case. I think this could be
+fixed (raised issue).
+
+`KVCache.forward(input_pos, k, v)`:
+- `input_pos`: `(1, T)` or `(B, T)`, where `T` is the number of new tokens
+- `k`, `v`: `(B, heads, T, head_size)`
+- `batched_index_copy_(self.k[:B], -2, input_pos, k)`: Copies `k` to positions in
+  'input_pos', then returns all of `self.k[:B]`. Same for `self.v` and `v`.
+  The cache buffer can have `batch_size > B` and this still works.
+
+This means that `k`, `v` returned by the cache have shape
+`(B, heads, max_seq_length, head_size)`, so span the whole sequence length. All
+of this goes into `scaled_dot_product_attention`. Things are masked out by the
+`mask` tensor of shape `(1, 1, T, max_seq_length)`. This is wasteful and
+can easily be changed, see [Small Extensions](#small-extensions).
+
+This KV cache implementation is quite naive, in that the cache requires the
+maximum amount of memory. If MHA is dense, this is the best we can do, but
+with sparse attention, we could do a lot better.
 
 
 ## Fine-tuning with LoRA and Adapters 
 
-HIER!
+
+## Project Ideas
+
+### Small Extensions
+
+* `KVCache` buffers are too large in the case `1 < n_query_groups < n_head`, see
+  [above](#kvcache-implementation). Make sure they are only
+  `(batch_size, n_query_groups, max_seq_length, head_size)`.
+* `k` and `v` tensors returned by `KVCache.forward` are too large, see
+  [above](#kvcache-implementation). Make sure they are of shape
+  `(B, heads, M, head_size)`, where `M - 1` is the maximum of all entries in
+  `input_pos`. We also subselect `mask = mask[..., :M]`, shape `(1, 1, T, M)`
+  to make this work.
+* Proper batched generation, where prompts in batch can have different lengths.
+  Prefill until length of shortest prompt, then token-by-token, so that new
+  tokens are either sampled or taken from the not-yet-completed prompt. This
+  is simple to do. Can we do something better? Also, if some sequences stop
+  early do to EOS token, it is easiest just to continue sampling, but not using
+  these tokens. Could do better by narrowing generation to sequences not yet
+  completed, but this need narrowing the KV cache as well.
+
+### Advanced KV Cache
+
+Desired properties:
+- Fixed maximum size in terms of KV vectors, independent of the maximum sequence
+  length
+- Slot indexed by token position, contains KV vectors for that token
+- Once cache is full, tokens are evicted, using a smart strategy
+- Most recent M tokens are always cached
+
+Should support heavy hitter oracle, where tokens are scored by how much they
+contribute to their distribution over V vectors, for the most recent token.
+Other thoughts:
+- Atomic score assigned to token position where generation takes place. If
+  output for head is sum of `sigma[j] v[j]`, `j` over cached tokens,
+  `sigma[j]` the softmax outputs, a score could be `|sigma[j] v[j]|`, which
+  takes the norm of V vectors into account as well. Importantly, we can
+  obtain the `sigma[j]` as byproduct of the MHA computation for free.
+- Score for eviction decision could be weighted average over atomic scores
+  from a window of last recent tokens generated.
+- How to best deal with different heads (or, more general, query groups)? If
+  several Q vectors are used per query group, we average atomic scores over
+  these. Then, we can maintain different lists of cached token positions per
+  query group. This means that sparse attention patterns can be different per
+  query group.
+- Also consider simple quantization of K, V vectors, for example
+  `k = k_s + a * 1`, `k_s` with `D - 1` nonzeros, `a` scalar, so use
+  `D` scalars and a bit vector of size `head_size`. This only makes sense if
+  the MHA computations can be done without materializing the non-quantized
+  tensors. Maybe not such a good idea.
+
+TODO:
+- First check whether there is a repo implementing KV cache strategies. Can
+  that code be used?
+- Also try to do some literature review on KV cache strategies
