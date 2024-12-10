@@ -21,6 +21,23 @@ Why not study Hugging Face?
   LitGPT codebase
 
 
+## Setup LitGPT for Development
+
+This needs creating a virtual environment. It is also important (for now) to
+not use `Python 3.13`, since `PyTorch` does not support it yet. Make sure to
+have `python@3.12` installed by `HomeBrew` (or an earlier version, then change
+the version below). Then:
+
+```bash
+$(brew --prefix python@3.12)/bin/python3.12 --version
+$(brew --prefix python@3.12)/bin/python3.12 -m venv deeplearn_venv
+. litgpt_venv/bin/activate
+pip install --upgrade pip
+pip install -e .[all]
+pip install -e .[test]
+```
+
+
 ## Configuration
 
 File: `litgpt/config.py`.
@@ -459,6 +476,7 @@ with sparse attention, we could do a lot better.
 
 ## Fine-tuning with LoRA and Adapters 
 
+TODO
 
 ## Project Ideas
 
@@ -479,6 +497,21 @@ with sparse attention, we could do a lot better.
   early do to EOS token, it is easiest just to continue sampling, but not using
   these tokens. Could do better by narrowing generation to sequences not yet
   completed, but this need narrowing the KV cache as well.
+* Clean up adapter and LoRA code. Right now, lots of copy&paste from base model.
+
+### Work Log
+
+Improvements of `KVCache` (branch `kvcache_improvements`):
+- `CausalSelfAttention.forward`: Move expand and reshape to after `kv_cache` is
+  used. Ensures that KV cache size depends on `n_query_groups`. [OK]
+- 'KVCache': `covering_length`, modify `forward`, and subselect `mask` in
+  `GPT.forward`. Ensure that MHA is done with shorter `k`, `v`. [OK]
+- Refactor `GPT.forward` to simplify `adapter.py` [OK]
+- Refactor `adapter.py`, `adapter_v2.py`, `lora.py` to use as much code of
+  `model.py` as possible. Right now, this is copy&paste [OK]
+- 
+- Fix failing tests [HIER!]
+  Step-by-step. Take out 2nd improvement first
 
 ### Advanced KV Cache
 
