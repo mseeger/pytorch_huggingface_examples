@@ -191,6 +191,7 @@ def forward(
     input_pos: Optional[torch.Tensor] = None,
 ) -> torch.Tensor:
 ```
+
 `x` has shape `(B, T, n_embd)`. `input_pos` is given for generative inference.
 Let `hs = head_size`, `nqg = n_query_groups`:
 
@@ -221,6 +222,7 @@ def scaled_dot_product_attention(
     mask: Optional[torch.Tensor] = None
 ) -> torch.Tensor:
 ```
+
 `q` has shape `(B, n_head, T1, hs)`, `k`, `v` have shape `(B, n_head, T2, hs)`, 
 where `T2 >= T1`. If `mask` is given, it has shape `(T1, T2)`. Note that the
 default is `mask = None`, which means causal self-attention, where also
@@ -316,21 +318,101 @@ convention here would be suboptimal.
 
 #### What is Hugging Face doing?
 
-`src/transformers/modeling_rope_utils.py`:
-- `_compute_default_rope_parameters`, `ROPE_INIT_FUNCTIONS["default"]`: Compute
-  `theta` parameters by default.
-- `_compute_llama3_parameters`, `ROPE_INIT_FUNCTIONS["llama3"]`: Additional
-  adjustments given by `rope_adjustments` above.
-- They seem to only register the `theta` vector, as "inv_freq"
+There are unit tests comparing LitGPT against Hugging Face, so the RoPE code
+must do exactly the same.
 
-The rest is done specific for every model. For example:
-`src/transformers/models/gpt_neox/modeling_gpt_neox.py`:
-- `GPTNeoXRotaryEmbedding`: Registers `theta` as "inv_freq". `forward` computes
-  `sin`, `cos` of shape `(B, T, hs)`, where `B` is batch size. The input is
-  `position_ids` of shape `(B, T)`, which can have different positions for each
-  case in the batch. If `B = 1` and `position_ids = arange(0, T)`, this is the
-  same as in LitGPT.
-- `apply_rotary_pos_emb`, `rotate_half`: They do the same as in LitGPT.
+`src/transformers/modeling_rope_utils.py`:
+```python
+def _compute_default_rope_parameters(...):
+    base = config.rope_theta
+    partial_rotary_factor = config.partial_rotary_factor if hasattr(config, "partial_rotary_factor") else 1.0
+    head_dim = getattr(config, "head_dim", config.hidden_size // config.num_attention_heads)
+    dim = int(head_dim * partial_rotary_factor)
+    attention_factor = 1.0  # Unused in this type of RoPE
+    # Compute the inverse frequencies
+    inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.int64).float().to(device) / dim))
+    return inv_freq, attention_factor
+
+ROPE_INIT_FUNCTIONS["default"] = _compute_default_rope_parameters
+```
+- `dim` here is `rope_n_elem` in LitGPT. Can be odd
+- `inv_freq.size = ceil(dim / 2)`. If `dim` is odd, `2 * inv_freq.size = dim + 1`.
+
+`src/transformers/mnodels/gpt_neox/modeling_gpt_neox.py`
+```python
+class GPTNeoXRotaryEmbedding(nn.Module):
+    def __init__(self, ..., config: Optional[GPTNeoXConfig] = None):
+        # ...
+        self.rope_init_fn = ROPE_INIT_FUNCTIONS[self.rope_type]
+
+        inv_freq, self.attention_scaling = self.rope_init_fn(self.config, device, **self.rope_kwargs)
+        self.register_buffer("inv_freq", inv_freq, persistent=False)
+        self.original_inv_freq = self.inv_freq
+    
+    @torch.no_grad()
+    def forward(self, x, position_ids):
+        if "dynamic" in self.rope_type:
+            self._dynamic_frequency_update(position_ids, device=x.device)
+
+        # Core RoPE block
+        inv_freq_expanded = self.inv_freq[None, :, None].float().expand(position_ids.shape[0], -1, 1)
+        position_ids_expanded = position_ids[:, None, :].float()
+        # Force float32 (see https://github.com/huggingface/transformers/pull/29285)
+        device_type = x.device.type
+        device_type = device_type if isinstance(device_type, str) and device_type != "mps" else "cpu"
+        with torch.autocast(device_type=device_type, enabled=False):
+            freqs = (inv_freq_expanded.float() @ position_ids_expanded.float()).transpose(1, 2)
+            emb = torch.cat((freqs, freqs), dim=-1)
+            cos = emb.cos()
+            sin = emb.sin()
+
+        # Advanced RoPE types (e.g. yarn) apply a post-processing scaling factor, equivalent to scaling attention
+        cos = cos * self.attention_scaling
+        sin = sin * self.attention_scaling
+
+        return cos.to(dtype=x.dtype), sin.to(dtype=x.dtype)
+```
+- Only type and device of `x` are used
+- `inv_freq.shape = (ifl,)`, `position_ids.shape = (bs, T)`, where `bs`
+  can be 1 (non-batched). `ifl = ceil(rope_n_elem / 2)`
+- `inv_freq_expanded.shape = (bs, ifl, 1)`
+- `position_ids_expanded.shape = (bs, 1, T)`
+- `freqs.shape = (bs, T, ifl), cos.shape = (bs, T, 2 * ifl)`.
+  This final dimension is `2 * ceil(rope_n_elem / 2) = rope_n_elem + 1` if
+  `rope_n_elem` is odd
+
+```python
+class GPTNeoXAttention(nn.Module):
+    def __init__(self, config, layer_idx):
+        self.head_size = self.hidden_size // self.num_attention_heads
+        self.rotary_ndims = int(self.head_size * config.rotary_pct)
+        self.rotary_emb = GPTNeoXRotaryEmbedding(config=self.config)
+        self.query_key_value = nn.Linear(
+            config.hidden_size,
+            3 * config.hidden_size,
+            bias=config.attention_bias
+        )
+
+    def forward(hidden_states, attention_mask, position_ids, ...):
+        query, key, value, present = self._attn_projections_and_rope(
+            hidden_states=hidden_states,
+            position_ids=position_ids,
+            layer_past=layer_past,
+            use_cache=use_cache,
+            position_embeddings=position_embeddings,
+        )
+        attn_output, attn_weights = self._attn(
+            query, key, value, attention_mask, head_mask
+        )
+        attn_output = self._merge_heads(
+            attn_output, self.num_attention_heads, self.head_size
+        )
+        # ...
+```
+
+This code is calling `apply_rotary_pos_emb`, `rotate_half`. They do the same
+as in LitGPT, except that the wrong shape of `cos`, `sin` for odd `rope_n_elem`
+is ignored. This should be a bug.
 
 Hugging Face does the same as LitGPT, which deviates from the RoPE paper.
 
@@ -482,6 +564,7 @@ TODO
 
 ### Small Extensions
 
+Done:
 * `KVCache` buffers are too large in the case `1 < n_query_groups < n_head`, see
   [above](#kvcache-implementation). Make sure they are only
   `(batch_size, n_query_groups, max_seq_length, head_size)`.
@@ -490,6 +573,9 @@ TODO
   `(B, heads, M, head_size)`, where `M - 1` is the maximum of all entries in
   `input_pos`. We also subselect `mask = mask[..., :M]`, shape `(1, 1, T, M)`
   to make this work.
+* Clean up adapter and LoRA code. Right now, lots of copy&paste from base model.
+
+Not started:
 * Proper batched generation, where prompts in batch can have different lengths.
   Prefill until length of shortest prompt, then token-by-token, so that new
   tokens are either sampled or taken from the not-yet-completed prompt. This
@@ -497,11 +583,12 @@ TODO
   early do to EOS token, it is easiest just to continue sampling, but not using
   these tokens. Could do better by narrowing generation to sequences not yet
   completed, but this need narrowing the KV cache as well.
-* Clean up adapter and LoRA code. Right now, lots of copy&paste from base model.
 
 ### Work Log
 
-Improvements of `KVCache` (branch `kvcache_improvements`):
+#### Improvements of `KVCache` (branch `kvcache_improvements`)
+
+TODO:
 - `CausalSelfAttention.forward`: Move expand and reshape to after `kv_cache` is
   used. Ensures that KV cache size depends on `n_query_groups`. [OK]
 - 'KVCache': `covering_length`, modify `forward`, and subselect `mask` in
@@ -509,9 +596,78 @@ Improvements of `KVCache` (branch `kvcache_improvements`):
 - Refactor `GPT.forward` to simplify `adapter.py` [OK]
 - Refactor `adapter.py`, `adapter_v2.py`, `lora.py` to use as much code of
   `model.py` as possible. Right now, this is copy&paste [OK]
-- 
-- Fix failing tests [HIER!]
-  Step-by-step. Take out 2nd improvement first
+- Make test_against_gpt_neox_model work: This is due to a bug in
+  Hugging Face! [OK]
+- Cannot compute covering_length from input_pos, this induces a graph break.
+  But can pass this value in, which works in the normal cases. If not passed
+  in, the subselection is not done [OK]
+- Make test_model_compile work [OK]
+- Run all tests [MOVE ON]
+  tests/test_readme.py, test_finetune_model:
+  RuntimeError: Command 'litgpt finetune_lora checkpoints/EleutherAI/pythia-14m --lora_r 1 --data JSON --data.json_path /private/var/folders/kj/trnztfjn67j9by8wztm_6y8m0000gn/T/pytest-of-seeger/pytest-21/test_finetune_model0/custom_finetuning_dataset.json --data.val_split_fraction 0.00001 --train.max_steps 1 --out_dir /private/var/folders/kj/trnztfjn67j9by8wztm_6y8m0000gn/T/pytest-of-seeger/pytest-21/test_finetune_model0/out/lora' failed with exit status 2
+  Error:
+  usage: litgpt [options] finetune_lora [-h] ...
+  error: cannot unpack non-iterable ActionTypeHint object
+  - Also in main branch
+  - ActionTypeHint is in jsonargparse
+- Check other generate code (input_pos given), insert input_pos_maxp1 if possible.
+  There is generate.base.batched_generate_fn, but this is not currently
+  used [OK]
+- New unit tests [OK]
+- Reproduce HF bug? If so, file bug report [OK]
+  https://github.com/huggingface/transformers/issues/35233
+
+OK: https://github.com/Lightning-AI/litgpt/pull/1870
+
+#### Hugging Face transformers: Fix RoPE Bug
+
+Any models on hub affected?
+- gpt-neox-20b:
+  hidden_size=6144, num_attention_heads=64, rotary_pct=0.25:
+  rotary_ndims=24
+- japanese-gpt-neox-3.6b-instruction-sft:
+  hidden_size=2816, num_attention_heads=22, rotary_pct=1:
+  rotary_ndims=128
+- gpt-neox-japanese-2.7b:
+  hidden_size=2560, num_attention_heads=32, rotary_pct=1:
+  rotary_ndims=80
+- gpt_neox_225M:
+  hidden_size=1024, num_attention_heads=12, rotary_pct=0.25:
+  head_size=85, rotary_ndims=21 [UUPS!]
+- tiny-random-GPTNeoXForCausalLM:
+  hidden_size=32, num_attention_heads=4, rotary_pct=0.25:
+  rotary_ndims=2
+- shahules786/Reward-model-gptneox-410M:
+  hidden_size=1024, num_attention_heads=16, rotary_pct=0.25:
+  rotary_ndims=16
+- mkshing/gpt-neox-185m-init:
+  hidden_size=768, num_attention_heads=12, rotary_pct=0.25:
+  rotary_ndims=16
+- mkshing/gpt-neox-285m-init
+  hidden_size=1024, num_attention_heads=12, rotary_pct=0.25:
+  head_size=85, rotary_ndims=21 [UUPS!]
+
+Any others under `models` use `ROPE_INIT_FUNCTIONS`?
+./aria/modeling_aria.py:
+./cohere/modeling_cohere.py:
+./falcon/modeling_falcon.py:
+./gpt_neox/modeling_gpt_neox.py:
+./gpt_neox_japanese/modeling_gpt_neox_japanese.py:
+./granite/modeling_granite.py:
+./granitemoe/modeling_granitemoe.py:
+./llama/modeling_llama.py:
+./mllama/modeling_mllama.py:
+./nemotron/modeling_nemotron.py:
+./olmoe/modeling_olmoe.py:
+./persimmon/modeling_persimmon.py:
+./phi/modeling_phi.py:
+./phimoe/modeling_phimoe.py:
+./qwen2/modeling_qwen2.py:
+./qwen2_moe/modeling_qwen2_moe.py:
+./qwen2_vl/modeling_qwen2_vl.py:
+./stablelm/modeling_stablelm.py:
+./starcoder2/modeling_starcoder2.py:
+
 
 ### Advanced KV Cache
 
