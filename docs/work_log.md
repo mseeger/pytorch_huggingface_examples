@@ -213,24 +213,65 @@ TODO:
   configs
 - recurrent_gemma: rot and pass. Changed [OK]
 - Refactor models one by one [OK]
+- Fixed several bugs in gptj/modeling_gptj.py, GPTJAttention: [OK]
+  - pos_embd_dim is self.head_dim if config.rotary_dim is None!
+  - RoPE is applied separately to every head. The flatten(-2) in
+    rotate_every_two is wrong!
+- Fix in olmo2: Attention classes Olmo2* were not used, at least
+  in modular_olmo2
+- Cleaned up recurrent_gemma
+- Fixed bug in esm: RoPE embedding depends on position_ids, must be passed
 - Run existing tests, only for models changed [OK]
   run_tests, models_changed.txt
 - Add test for gpt_neox model: Use the litgpt ones [OK]
 - Write common Mixin [OK]
-- Insert into all affected models, run tests [HIER]
-  - aria: Hangs [TODO]
-  - chameleon: Needs config.vocabulary_map [TODO]
-  - clvp: ClvpRotaryPositionalEmbedding.forward is different [TODO]
-  - codegen: Nonstandard, no *Embedding [TODO]
+- Insert into all affected models, run tests:
+  - aria: Text model is just llama [DROP]
+  - chameleon: Needs config.vocabulary_map [OK]
+  - clvp: Weird case, drop this [DROP]
+  - codegen: Makes no sense [DROP]
   - cohere [OK]
-  - dbrx: Non-standard [TODO]
-  - esm: What happens if position_ind is used in forward?? [TODO]
+  - dbrx: Non-standard [OK]
+  - esm: Had to fix a bug [OK]
   - falcon [OK]
   - gemma: Tough [OK]
   - gemma2: [OK]
   - glm [OK]
   - gpt_neox, gpt_neox_japanese [OK]
-  - gptj [HIER]
+  - gptj: Nonstandard! Tough! [OK]
+  - granite: [OK]
+  - granitemoe [OK]
+  - idefics: Mixed up with image model [DROP]
+  - jetmoe: Nonstandard [OK]
+  - llama [OK]
+  - mimi: Nonstandard [OK]
+  - mistral [OK]
+  - mixtral [OK]
+  - mllama [OK]
+  - nemotron [OK]
+  - olmo [OK]
+  - olmo2: [OK]
+  - olmoe [OK]
+  - persimmon [OK]
+  - phi [OK]
+  - phi3 [OK]
+  - phimoe [OK]
+  - pixtral: No changes [OK]
+  - qwen2 [OK]
+  - qwen2_moe [OK]
+  - qwen2_vl: rope_scaling["mrope_section"] not documented [DROP]
+  - recurrent_gemma [OK]
+  - stablelm [OK]
+  - starcoder2 [OK]
+
+- Run all new tests once more: [OK]
+  - falcon
+- Look for _gradient_checkpointing_func: Ordering of args!
+  All but clvp, esm, qwen2_vl [HIER]
+  Got until gptj
+- Fix of gptj: Can we do this better, as in gpt_neox?
+- First submit a PR with bug fixes: git diff main, what is not related to
+  original job?
 
 `run_tests`:
 ```bash
@@ -239,7 +280,7 @@ TODO:
 for x in $(cat models_changed.txt)
 do
   echo "[$x]"
-  pytest tests/models/$x/ >$x.std.log 2>$x.err.log
+  pytest -k rotary_ndims_odd tests/models/$x/ >$x.std.log
 done
 ```
 models_changed.txt:
