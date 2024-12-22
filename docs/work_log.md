@@ -267,11 +267,36 @@ TODO:
 - Run all new tests once more: [OK]
   - falcon
 - Look for _gradient_checkpointing_func: Ordering of args!
-  All but clvp, esm, qwen2_vl [HIER]
-  Got until gptj
-- Fix of gptj: Can we do this better, as in gpt_neox?
+  All but clvp, esm, qwen2_vl [OK]
+- Check modeling for modular <-> modeling [OK]
+  glm, starcoder2, aria, olmo2
+- Pull recent main, rebase [OK]
+- Make Github properly work here (keys?), then push [OK]
+- Run all new tests again [OK]
+- Install torch-vision, run mllama test again [OK]
 - First submit a PR with bug fixes: git diff main, what is not related to
-  original job?
+  original job? [OK]
+- Rebase to `fixrope_part1`: New branch `fix_rope3`
+
+First PR: Branch `fixrope_part1`:
+- Create branch by diff [OK]
+- Run tests for all models [OK]
+- Prepare: [OK]
+  https://github.com/huggingface/transformers/blob/main/CONTRIBUTING.md#create-a-pull-request
+  Currently: make fixup [differences between modeling_* and generated]
+- All sorts of CI failures: Run everything again! [OK]
+  - Run tests [OK]
+  - Run "make fixup" [OK]
+- Check modeling_gptj changes, simplify [OK]
+- Extend gptj changes to tf, flax as well [OK]
+- Same for esm [OK]
+- Fix codegen same as gptj [OK]
+    
+
+OK: https://github.com/huggingface/transformers/pull/35376
+
+Wait until this is in [HIER]
+
 
 `run_tests`:
 ```bash
@@ -327,10 +352,16 @@ stablelm
 starcoder2
 ```
 
-Tests which failed:
-- aria: cannot import name 'PILImageResampling' from 'transformers.image_utils'
-  FIXED
-- clvp: Errors [30] FIXED
-- phi: Errors [1] FIXED
+----
+> python utils/check_config_attributes.py
+ValueError: The following configuration classes contain unused attributes in the corresponding modeling files:
+GPTNeoXConfig: ['rotary_emb_base', 'rotary_pct']
+GPTNeoXJapaneseConfig: ['rotary_emb_base', 'rotary_pct']
+==> FIXED
 
-All tests pass now!
+FAILED tests/models/gptj/test_modeling_gptj.py::GPTJModelTest::test_pt_tf_model_equivalence - AssertionError: 0.008812159 not less than or equal to 0.0001 : outputs.last_hidden_state: Difference between PyTorch and TF is 0.008812159299850464 (>= 0.0001) for GPTJModel
+FAILED tests/models/gptj/test_modeling_tf_gptj.py::TFGPTJModelTest::test_pt_tf_model_equivalence - AssertionError: 0.001009956 not less than or equal to 0.0001 : outputs.logits: Difference between torch and tf is 0.0010099560022354126 (>= 0.0001).
+
+FAILED tests/models/gptj/test_modeling_gptj.py::GPTJModelTest::test_equivalence_flax_to_pt - AssertionError: 0.0082448125 not less than or equal to 0.0001 : outputs.last_hidden_state: Difference between PyTorch and Flax is 0.008244812488555908 (>= 0.0001).
+FAILED tests/models/gptj/test_modeling_gptj.py::GPTJModelTest::test_equivalence_pt_to_flax - AssertionError: 0.010561585 not less than or equal to 0.0001 : outputs.last_hidden_state: Difference between PyTorch and Flax is 0.010561585426330566 (>= 0.0001).
+----
