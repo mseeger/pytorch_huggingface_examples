@@ -7,9 +7,6 @@ Repos I am currently working on:
 
 ## Done
 
-
-## In Review
-
 ### LitGPT: Small fixes and refactoring
 
 `git/forks/litgpt`, branch `small_fixes`:
@@ -25,9 +22,12 @@ Repos I am currently working on:
 
 OK: https://github.com/Lightning-AI/litgpt/pull/1861
 
+
+## In Review
+
 ### LitGPT: Improvements of `KVCache`
 
-`git/forks/litgpt`, branch `kvcache_improvements2`:
+`git/forks/litgpt`, branch `kvcache_improvements4`:
 
 - `CausalSelfAttention.forward`: Move expand and reshape to after `kv_cache` is
   used. Ensures that KV cache size depends on `n_query_groups`. [OK]
@@ -55,8 +55,13 @@ OK: https://github.com/Lightning-AI/litgpt/pull/1861
   used [OK]
 - New unit tests [OK]
 - Reproduce HF bug? If so, file bug report [OK]
+- Rebase on current main [OK]
+- Restore old copy&paste constructors: [OK]
+  Branch: `kvcache_improvements4`
+- Fix tests [OK]
+  test_adapter_v2.py still fails. Why?
 
-OK: https://github.com/Lightning-AI/litgpt/pull/1870
+OK: https://github.com/Lightning-AI/litgpt/pull/1891
 
 
 ## Currently Working On
@@ -291,11 +296,16 @@ First PR: Branch `fixrope_part1`:
 - Extend gptj changes to tf, flax as well [OK]
 - Same for esm [OK]
 - Fix codegen same as gptj [OK]
-    
+- Rebase to current main [OK]
+- Comparison tests fail for gptj [HIER!]
+  - Shapes are the same
+  - OK: tests_torch_and_tf pass now!
+  - tests_torch_and_flax fails now
 
 OK: https://github.com/huggingface/transformers/pull/35376
 
 Wait until this is in [HIER]
+
 
 
 `run_tests`:
@@ -352,16 +362,19 @@ stablelm
 starcoder2
 ```
 
-----
-> python utils/check_config_attributes.py
-ValueError: The following configuration classes contain unused attributes in the corresponding modeling files:
-GPTNeoXConfig: ['rotary_emb_base', 'rotary_pct']
-GPTNeoXJapaneseConfig: ['rotary_emb_base', 'rotary_pct']
-==> FIXED
+### PyTorch Sources of Multi-Head Attention
 
-FAILED tests/models/gptj/test_modeling_gptj.py::GPTJModelTest::test_pt_tf_model_equivalence - AssertionError: 0.008812159 not less than or equal to 0.0001 : outputs.last_hidden_state: Difference between PyTorch and TF is 0.008812159299850464 (>= 0.0001) for GPTJModel
-FAILED tests/models/gptj/test_modeling_tf_gptj.py::TFGPTJModelTest::test_pt_tf_model_equivalence - AssertionError: 0.001009956 not less than or equal to 0.0001 : outputs.logits: Difference between torch and tf is 0.0010099560022354126 (>= 0.0001).
+We know that `torch.nn.functional.scaled_dot_product_attention` computes the
+relevant part of MHA in the most efficient way, but it does not return the
+attention weights. We need the latter for computing scores related to KV
+caching, such as H2O. Here, we dig into the sources to see how this could be
+done.
 
-FAILED tests/models/gptj/test_modeling_gptj.py::GPTJModelTest::test_equivalence_flax_to_pt - AssertionError: 0.0082448125 not less than or equal to 0.0001 : outputs.last_hidden_state: Difference between PyTorch and Flax is 0.008244812488555908 (>= 0.0001).
-FAILED tests/models/gptj/test_modeling_gptj.py::GPTJModelTest::test_equivalence_pt_to_flax - AssertionError: 0.010561585 not less than or equal to 0.0001 : outputs.last_hidden_state: Difference between PyTorch and Flax is 0.010561585426330566 (>= 0.0001).
-----
+* [_scaled_dot_product_attention_math](https://github.com/pytorch/pytorch/blob/2fa09853cbd5c774262a843436347fa14c1012a0/aten/src/ATen/native/transformers/attention.cpp#L792):
+  This `C++` function returns a tuple `(attn_output, attn_weights)`. We would
+  need the second entry.
+* [jagged_dot_product_attention](https://github.com/pytorch/pytorch/blob/2fa09853cbd5c774262a843436347fa14c1012a0/torch/nested/_internal/sdpa.py#L678):
+  Calls `_scaled_dot_product_attention_math` if `backend_choice == SDPBackend.MATH`.
+  There are other branches as well, calling functions from `torch.ops.aten`. Where
+  is the code for these?
+
