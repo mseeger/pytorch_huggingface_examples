@@ -22,8 +22,44 @@ Repos I am currently working on:
 
 OK: https://github.com/Lightning-AI/litgpt/pull/1861
 
+### PyTorch Sources of Multi-Head Attention
 
-## In Review
+We know that `torch.nn.functional.scaled_dot_product_attention` computes the
+relevant part of MHA in the most efficient way, but it does not return the
+attention weights. We need the latter for computing scores related to KV
+caching, such as H2O. Here, we dig into the sources to see how this could be
+done.
+
+* [_scaled_dot_product_attention_math](https://github.com/pytorch/pytorch/blob/2fa09853cbd5c774262a843436347fa14c1012a0/aten/src/ATen/native/transformers/attention.cpp#L792):
+  This `C++` function returns a tuple `(attn_output, attn_weights)`. We would
+  need the second entry.
+* [jagged_dot_product_attention](https://github.com/pytorch/pytorch/blob/2fa09853cbd5c774262a843436347fa14c1012a0/torch/nested/_internal/sdpa.py#L678):
+  Calls `_scaled_dot_product_attention_math` if `backend_choice == SDPBackend.MATH`.
+  There are other branches as well, calling functions from `torch.ops.aten`. Where
+  is the code for these?
+* [aten/src/ATen/native/transformers/attention.cpp](https://github.com/pytorch/pytorch/blob/2fa09853cbd5c774262a843436347fa14c1012a0/aten/src/ATen/native/transformers/attention.cpp#L696):
+  `scaled_dot_product_attention`: Depending on `backend`, many different functions
+  are called. All of them return a tuple `(output, logsumexp)`, and the function
+  returns the first argument. Subfunctions:
+  - `at::_scaled_dot_product_cudnn_attention`:
+  - `at::_scaled_dot_product_flash_attention`:
+  - `at::_scaled_dot_product_flash_attention_for_cpu`:
+  - `at::_scaled_dot_product_efficient_attention`:
+  - `at::_scaled_dot_product_fused_attention_overrideable`: Not implemented
+  - `at::_scaled_dot_product_attention_math_for_mps`:
+  - `at::_scaled_dot_product_attention_math`: Returns `(attn_output, attn_weights)`
+* [aten/src/ATen/native/transformers/cuda/attention.cu](https://github.com/pytorch/pytorch/blob/2fa09853cbd5c774262a843436347fa14c1012a0/aten/src/ATen/native/transformers/cuda/attention.cu):
+  In this code, if `query` has shape `(B, M, num_heads, K)`, `key` has shape
+  `(B, N, num_heads, K)`, `value` has shape `(B, N, num_heads, Kv)`, the functions
+  return a tuple `(output, logsumexp)`, where `output` has shape `(B, M, num_heads, Kv)`
+  and `logsumexp` has shape `(B, num_heads, max_seqlen_q)`, where by default
+  `max_seqlen_q = M`. `logsumexp` cannot be `attn_weights`, they would have to
+  have a shape depending on `max_seqlen_k` or `N`. DAMN!
+
+**Note**: We only need the attention weights in the generative inference case,
+when `query` is small (usually a single token). In this case, a naive
+implementation of MHA suffices. There is no need to call
+`torch.nn.functional.scaled_dot_product_attention`.
 
 ### LitGPT: Improvements of `KVCache`
 
@@ -62,6 +98,10 @@ OK: https://github.com/Lightning-AI/litgpt/pull/1861
   test_adapter_v2.py still fails. Why?
 
 OK: https://github.com/Lightning-AI/litgpt/pull/1891
+
+
+## In Review
+
 
 
 ## Currently Working On
@@ -306,8 +346,6 @@ OK: https://github.com/huggingface/transformers/pull/35376
 
 Wait until this is in [HIER]
 
-
-
 `run_tests`:
 ```bash
 #!/bin/bash
@@ -362,19 +400,28 @@ stablelm
 starcoder2
 ```
 
-### PyTorch Sources of Multi-Head Attention
+### LitGPT: New abstraction for KVCache
 
-We know that `torch.nn.functional.scaled_dot_product_attention` computes the
-relevant part of MHA in the most efficient way, but it does not return the
-attention weights. We need the latter for computing scores related to KV
-caching, such as H2O. Here, we dig into the sources to see how this could be
-done.
+Would like to implement a flexible KV cacheing framework on top of `LitGPT`.
+This should mostly be done in a separate repository, but needs to be supported
+on their side, mostly by passing attention weights in MHA to the KV cache.
+To get started, we implement things in a branch of a fork. Later, we will
+separate code into (a) own repo and (b) PR to them.
 
-* [_scaled_dot_product_attention_math](https://github.com/pytorch/pytorch/blob/2fa09853cbd5c774262a843436347fa14c1012a0/aten/src/ATen/native/transformers/attention.cpp#L792):
-  This `C++` function returns a tuple `(attn_output, attn_weights)`. We would
-  need the second entry.
-* [jagged_dot_product_attention](https://github.com/pytorch/pytorch/blob/2fa09853cbd5c774262a843436347fa14c1012a0/torch/nested/_internal/sdpa.py#L678):
-  Calls `_scaled_dot_product_attention_math` if `backend_choice == SDPBackend.MATH`.
-  There are other branches as well, calling functions from `torch.ops.aten`. Where
-  is the code for these?
+The first milestone would be to implement something that supports H2O.
 
+Note that we can use the naive MHA implementation given in
+`litgpt.model.CausalSelfAttention.scaled_dot_product_attention` (the branch
+called if `config.attention_logit_softcapping` is given), because the `q`
+tensor is small in this case.
+
+The very first step is a proper design, at least for the `KVCache` API.
+
+`git/forks/litgpt`, branch `kvcache`:
+
+- Work out design in technical report [OK]
+- Base class `KVCache` and `DenseKVCache` [OK]
+- Class `AttnWeightsKVCache`: Generic code, except for `_update`  [OK]
+- Implement class `H2OKVCache` [HIER]
+- Change stuff in `model.py` to use new cache
+- Implement single seq and batched generation loops
